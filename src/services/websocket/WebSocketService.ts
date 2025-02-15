@@ -1,289 +1,332 @@
-import { 
-    Injectable, 
-    OnModuleInit, 
-    OnModuleDestroy, 
-    Logger 
-} from '@nestjs/common';
-import { 
-    WebSocketGateway, 
-    WebSocketServer, 
-    SubscribeMessage, 
-    OnGatewayConnection,
-    OnGatewayDisconnect,
-    WsResponse,
-    ConnectedSocket
-} from '@nestjs/websockets';
-import { Server, Socket } from 'socket.io';
-import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
-import { AuthService } from '../auth/AuthService';
-import { MarketService } from '../market/MarketService';
-import { RedisService } from '../cache/RedisService';
-import { RateLimiterMemory } from 'rate-limiter-flexible';
-import { 
-    WebSocketMessage, 
-    MarketUpdateData,
-    OrderUpdateData,
-    WalletUpdateData 
-} from '../../types/websocket.types';
-import * as jwt from 'jsonwebtoken';
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { MetricsService } from '../metrics/MetricsService';
+import { AuditService } from '../audit/AuditService';
+import { Subject, BehaviorSubject } from 'rxjs';
+import { WebSocket } from 'ws';
+import { MarketEvent, MarketEventType, MarketChannel } from '../../types/market.types';
+import { RetryStrategy } from '../../utils/RetryStrategy';
 
-@WebSocketGateway({
-    cors: {
-        origin: process.env.FRONTEND_URL,
-        credentials: true
-    },
-    transports: ['websocket'],
-    namespace: '/trading'
-})
+interface WebSocketConnection {
+    ws: WebSocket;
+    url: string;
+    isAlive: boolean;
+    subscriptions: Set<string>;
+    reconnectAttempts: number;
+}
+
 @Injectable()
-export class WebSocketService implements OnModuleInit, OnModuleDestroy, OnGatewayConnection, OnGatewayDisconnect {
-    @WebSocketServer()
-    private server: Server;
+export class WebSocketService implements OnModuleInit, OnModuleDestroy {
+    private connections: Map<string, WebSocketConnection> = new Map();
+    private messageSubject = new Subject<MarketEvent>();
+    private connectionStatus = new BehaviorSubject<boolean>(false);
     
-    private readonly logger = new Logger(WebSocketService.name);
-    private readonly userSessions = new Map<string, Set<string>>();
-    private readonly marketSubscriptions = new Map<string, Set<string>>();
-    private readonly rateLimiter: RateLimiterMemory;
+    private readonly PING_INTERVAL = 30000;
+    private readonly MAX_RECONNECT_ATTEMPTS = 5;
+    private readonly INITIAL_RECONNECT_DELAY = 1000;
+    private readonly MAX_RECONNECT_DELAY = 30000;
+    private pingInterval: NodeJS.Timeout;
 
     constructor(
-        private readonly authService: AuthService,
-        private readonly marketService: MarketService,
-        private readonly redisService: RedisService,
-        private readonly eventEmitter: EventEmitter2
-    ) {
-        this.rateLimiter = new RateLimiterMemory({
-            points: 100, // Number of points
-            duration: 60, // Per 60 seconds
-        });
-    }
+        private readonly configService: ConfigService,
+        private readonly metricsService: MetricsService,
+        private readonly auditService: AuditService
+    ) {}
 
     async onModuleInit() {
-        await this.initializeMarketDataStreams();
-        this.startHeartbeat();
+        await this.initializeConnections();
+        this.startPingInterval();
     }
 
     async onModuleDestroy() {
-        this.server?.close();
-        await this.cleanupConnections();
+        this.stopPingInterval();
+        await this.closeAllConnections();
     }
 
-    async handleConnection(client: Socket) {
-        try {
-            const token = client.handshake.auth.token;
-            if (!token) {
-                throw new Error('Authentication required');
-            }
-
-            const decoded = await this.authService.verifyToken(token);
-            const userId = decoded.sub;
-
-            // Rate limiting check
-            try {
-                await this.rateLimiter.consume(userId);
-            } catch {
-                client.disconnect(true);
-                return;
-            }
-
-            // Store user session
-            if (!this.userSessions.has(userId)) {
-                this.userSessions.set(userId, new Set());
-            }
-            this.userSessions.get(userId)!.add(client.id);
-
-            // Set client data
-            client.data.userId = userId;
-            client.data.authenticated = true;
-
-            // Send initial state
-            await this.sendInitialState(client);
-
-            this.logger.log(`Client connected: ${client.id} (User: ${userId})`);
-        } catch (error) {
-            this.logger.error('Connection error', error);
-            client.disconnect(true);
+    private async initializeConnections() {
+        const endpoints = this.configService.get<string[]>('WEBSOCKET_ENDPOINTS');
+        
+        for (const endpoint of endpoints) {
+            await this.createConnection(endpoint);
         }
     }
 
-    handleDisconnect(client: Socket) {
+    private async createConnection(url: string): Promise<WebSocketConnection> {
         try {
-            const userId = client.data.userId;
-            if (userId) {
-                const userSessions = this.userSessions.get(userId);
-                if (userSessions) {
-                    userSessions.delete(client.id);
-                    if (userSessions.size === 0) {
-                        this.userSessions.delete(userId);
-                    }
-                }
-            }
-
-            // Cleanup market subscriptions
-            for (const [market, subscribers] of this.marketSubscriptions) {
-                subscribers.delete(client.id);
-                if (subscribers.size === 0) {
-                    this.marketSubscriptions.delete(market);
-                }
-            }
-
-            this.logger.log(`Client disconnected: ${client.id}`);
-        } catch (error) {
-            this.logger.error('Disconnect error', error);
-        }
-    }
-
-    @SubscribeMessage('subscribe_market')
-    async handleMarketSubscription(
-        @ConnectedSocket() client: Socket,
-        payload: { market: string }
-    ): Promise<WsResponse<boolean>> {
-        try {
-            if (!client.data.authenticated) {
-                throw new Error('Authentication required');
-            }
-
-            const { market } = payload;
-            
-            if (!this.marketSubscriptions.has(market)) {
-                this.marketSubscriptions.set(market, new Set());
-                await this.initializeMarketStream(market);
-            }
-            
-            this.marketSubscriptions.get(market)!.add(client.id);
-
-            // Send initial market data
-            const marketData = await this.marketService.getMarketData(market);
-            client.emit('market_update', {
-                market,
-                data: marketData
+            const ws = new WebSocket(url, {
+                handshakeTimeout: 10000,
+                perMessageDeflate: true,
+                headers: this.getAuthHeaders()
             });
 
-            return { event: 'subscribe_market', data: true };
+            const connection: WebSocketConnection = {
+                ws,
+                url,
+                isAlive: false,
+                subscriptions: new Set(),
+                reconnectAttempts: 0
+            };
+
+            this.setupWebSocketHandlers(connection);
+            this.connections.set(url, connection);
+
+            await this.waitForConnection(connection);
+            return connection;
         } catch (error) {
-            this.logger.error('Market subscription error', error);
-            return { event: 'subscribe_market', data: false };
+            await this.handleError('createConnection', error, { url });
+            throw error;
         }
     }
 
-    @OnEvent('trade.executed')
-    async handleTradeExecution(payload: any) {
-        try {
-            const { userId, tradeData, result } = payload;
+    private setupWebSocketHandlers(connection: WebSocketConnection) {
+        const { ws, url } = connection;
+
+        ws.on('open', async () => {
+            connection.isAlive = true;
+            connection.reconnectAttempts = 0;
+            this.connectionStatus.next(true);
             
-            // Notify user's active sessions
-            const userSessions = this.userSessions.get(userId);
-            if (userSessions) {
-                const message: WebSocketMessage<any> = {
-                    type: 'trade_executed',
-                    data: {
-                        trade: tradeData,
-                        result: result
-                    }
-                };
+            await this.auditService.logSystemEvent({
+                event: 'WEBSOCKET_CONNECTED',
+                details: { url },
+                severity: 'INFO'
+            });
 
-                for (const sessionId of userSessions) {
-                    this.server.to(sessionId).emit('message', message);
-                }
+            // Resubscribe to channels after reconnection
+            await this.resubscribeChannels(connection);
+        });
+
+        ws.on('message', async (data: Buffer) => {
+            try {
+                const message = JSON.parse(data.toString());
+                await this.handleMessage(message);
+                await this.metricsService.recordWebSocketMessage(message.type);
+            } catch (error) {
+                await this.handleError('messageHandler', error, { url });
             }
+        });
 
-            // Update market subscribers
-            await this.broadcastMarketUpdate(tradeData.market);
-        } catch (error) {
-            this.logger.error('Trade execution notification error', error);
-        }
-    }
+        ws.on('pong', () => {
+            connection.isAlive = true;
+        });
 
-    @OnEvent('order.updated')
-    async handleOrderUpdate(payload: OrderUpdateData) {
-        try {
-            const { userId, order } = payload;
-            const userSessions = this.userSessions.get(userId);
+        ws.on('error', async (error) => {
+            await this.handleError('websocketError', error, { url });
+        });
+
+        ws.on('close', async () => {
+            connection.isAlive = false;
+            this.connectionStatus.next(false);
             
-            if (userSessions) {
-                const message: WebSocketMessage<OrderUpdateData> = {
-                    type: 'order_update',
-                    data: payload
-                };
+            await this.auditService.logSystemEvent({
+                event: 'WEBSOCKET_DISCONNECTED',
+                details: { url },
+                severity: 'WARNING'
+            });
 
-                for (const sessionId of userSessions) {
-                    this.server.to(sessionId).emit('message', message);
-                }
-            }
-        } catch (error) {
-            this.logger.error('Order update notification error', error);
-        }
-    }
-
-    @OnEvent('wallet.updated')
-    async handleWalletUpdate(payload: WalletUpdateData) {
-        try {
-            const { userId, wallet } = payload;
-            const userSessions = this.userSessions.get(userId);
-            
-            if (userSessions) {
-                const message: WebSocketMessage<WalletUpdateData> = {
-                    type: 'wallet_update',
-                    data: payload
-                };
-
-                for (const sessionId of userSessions) {
-                    this.server.to(sessionId).emit('message', message);
-                }
-            }
-        } catch (error) {
-            this.logger.error('Wallet update notification error', error);
-        }
-    }
-
-    private async initializeMarketDataStreams() {
-        const activeMarkets = await this.marketService.getActiveMarkets();
-        
-        for (const market of activeMarkets) {
-            await this.initializeMarketStream(market.address);
-        }
-    }
-
-    private async initializeMarketStream(market: string) {
-        this.marketService.subscribeToMarketUpdates(market, async (data: MarketUpdateData) => {
-            await this.broadcastMarketUpdate(market, data);
+            await this.handleReconnection(connection);
         });
     }
 
-    private async broadcastMarketUpdate(market: string, data?: MarketUpdateData) {
-        const subscribers = this.marketSubscriptions.get(market);
-        if (!subscribers) return;
+    private async handleReconnection(connection: WebSocketConnection) {
+        if (connection.reconnectAttempts >= this.MAX_RECONNECT_ATTEMPTS) {
+            await this.auditService.logSystemEvent({
+                event: 'WEBSOCKET_RECONNECTION_FAILED',
+                details: {
+                    url: connection.url,
+                    attempts: connection.reconnectAttempts
+                },
+                severity: 'ERROR'
+            });
+            return;
+        }
 
-        const marketData = data || await this.marketService.getMarketData(market);
-        const message: WebSocketMessage<MarketUpdateData> = {
-            type: 'market_update',
-            data: marketData
+        const delay = RetryStrategy.exponentialBackoff(
+            connection.reconnectAttempts,
+            this.INITIAL_RECONNECT_DELAY,
+            this.MAX_RECONNECT_DELAY
+        );
+
+        connection.reconnectAttempts++;
+
+        setTimeout(async () => {
+            try {
+                await this.createConnection(connection.url);
+            } catch (error) {
+                await this.handleError('reconnection', error, { url: connection.url });
+            }
+        }, delay);
+    }
+
+    async subscribe(channel: string, callback: (data: any) => void): Promise<void> {
+        const connection = this.getOptimalConnection();
+        if (!connection) {
+            throw new Error('No available WebSocket connections');
+        }
+
+        try {
+            const subscribeMessage = {
+                type: 'subscribe',
+                channel,
+                auth: this.getAuthToken()
+            };
+
+            connection.ws.send(JSON.stringify(subscribeMessage));
+            connection.subscriptions.add(channel);
+
+            this.messageSubject.subscribe((event: MarketEvent) => {
+                if (event.type === channel) {
+                    callback(event.data);
+                }
+            });
+
+            await this.auditService.logSystemEvent({
+                event: 'WEBSOCKET_SUBSCRIBED',
+                details: { channel },
+                severity: 'INFO'
+            });
+        } catch (error) {
+            await this.handleError('subscribe', error, { channel });
+            throw error;
+        }
+    }
+
+    async unsubscribe(channel: string): Promise<void> {
+        for (const connection of this.connections.values()) {
+            if (connection.subscriptions.has(channel)) {
+                try {
+                    const unsubscribeMessage = {
+                        type: 'unsubscribe',
+                        channel
+                    };
+
+                    connection.ws.send(JSON.stringify(unsubscribeMessage));
+                    connection.subscriptions.delete(channel);
+
+                    await this.auditService.logSystemEvent({
+                        event: 'WEBSOCKET_UNSUBSCRIBED',
+                        details: { channel },
+                        severity: 'INFO'
+                    });
+                } catch (error) {
+                    await this.handleError('unsubscribe', error, { channel });
+                }
+            }
+        }
+    }
+
+    private async handleMessage(message: any) {
+        if (message.type === 'error') {
+            await this.handleError('serverError', new Error(message.message), message);
+            return;
+        }
+
+        const event: MarketEvent = {
+            type: message.type as MarketEventType,
+            market: message.market,
+            timestamp: Date.now(),
+            data: message.data
         };
 
-        for (const sessionId of subscribers) {
-            this.server.to(sessionId).emit('message', message);
+        this.messageSubject.next(event);
+    }
+
+    private startPingInterval() {
+        this.pingInterval = setInterval(() => {
+            for (const connection of this.connections.values()) {
+                if (!connection.isAlive) {
+                    connection.ws.terminate();
+                    continue;
+                }
+
+                connection.isAlive = false;
+                connection.ws.ping();
+            }
+        }, this.PING_INTERVAL);
+    }
+
+    private stopPingInterval() {
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
         }
     }
 
-    private async sendInitialState(client: Socket) {
-        const userId = client.data.userId;
-        
-        // Send active orders
-        const activeOrders = await this.marketService.getUserActiveOrders(userId);
-        client.emit('initial_state', {
-            orders: activeOrders,
-            timestamp: new Date()
+    private async closeAllConnections() {
+        for (const connection of this.connections.values()) {
+            connection.ws.close();
+        }
+        this.connections.clear();
+    }
+
+    private getOptimalConnection(): WebSocketConnection | null {
+        // Simple round-robin selection for now
+        // Could be enhanced with load balancing metrics
+        for (const connection of this.connections.values()) {
+            if (connection.isAlive) {
+                return connection;
+            }
+        }
+        return null;
+    }
+
+    private async resubscribeChannels(connection: WebSocketConnection) {
+        for (const channel of connection.subscriptions) {
+            try {
+                const subscribeMessage = {
+                    type: 'subscribe',
+                    channel,
+                    auth: this.getAuthToken()
+                };
+                connection.ws.send(JSON.stringify(subscribeMessage));
+            } catch (error) {
+                await this.handleError('resubscribe', error, { channel });
+            }
+        }
+    }
+
+    private getAuthHeaders(): Record<string, string> {
+        return {
+            'Authorization': `Bearer ${this.getAuthToken()}`,
+            'X-API-Key': this.configService.get<string>('API_KEY')
+        };
+    }
+
+    private getAuthToken(): string {
+        return this.configService.get<string>('AUTH_TOKEN');
+    }
+
+    private async handleError(
+        operation: string,
+        error: Error,
+        context: any
+    ): Promise<void> {
+        await this.auditService.logSystemEvent({
+            event: 'WEBSOCKET_ERROR',
+            details: {
+                operation,
+                error: error.message,
+                context
+            },
+            severity: 'ERROR'
         });
+        await this.metricsService.incrementWebSocketError(operation);
     }
 
-    private startHeartbeat() {
-        setInterval(() => {
-            this.server.emit('heartbeat', { timestamp: new Date() });
-        }, 30000); // Every 30 seconds
-    }
+    private waitForConnection(connection: WebSocketConnection): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('WebSocket connection timeout'));
+            }, 10000);
 
-    private async cleanupConnections() {
-        this.userSessions.clear();
-        this.marketSubscriptions.clear();
-        await this.marketService.unsubscribeAllMarketUpdates();
+            connection.ws.once('open', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+
+            connection.ws.once('error', (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+        });
     }
 }
