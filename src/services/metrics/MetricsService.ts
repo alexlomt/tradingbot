@@ -1,243 +1,284 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { InjectMetric } from '@nestjs/prometheus';
+import { PrometheusService } from '../prometheus/PrometheusService';
 import { Counter, Gauge, Histogram } from 'prom-client';
-import { RedisService } from '../cache/RedisService';
-import { InfluxDB, Point } from '@influxdata/influxdb-client';
-import { MetricsConfig } from '../../config/metrics.config';
-import { TradingMetrics, SystemMetrics } from '../../types/metrics.types';
+import { RedisService } from '../redis/RedisService';
+import { AuditService } from '../audit/AuditService';
 
 @Injectable()
 export class MetricsService implements OnModuleInit {
-    private influxDB: InfluxDB;
-    private readonly metricsBuffer: Map<string, Point[]> = new Map();
-    private flushInterval: NodeJS.Timeout;
+    // Trading Metrics
+    private tradingVolume: Counter;
+    private tradingValue: Counter;
+    private orderCount: Counter;
+    private profitLoss: Gauge;
+    private tradingLatency: Histogram;
+    private positionSize: Gauge;
+    private liquidityDepth: Gauge;
+
+    // Performance Metrics
+    private systemLoad: Gauge;
+    private memoryUsage: Gauge;
+    private apiLatency: Histogram;
+    private errorRate: Counter;
+
+    // Cache Metrics
+    private cacheHits: Counter;
+    private cacheMisses: Counter;
+    private cacheLatency: Histogram;
+    private cacheSize: Gauge;
+
+    // Market Metrics
+    private marketVolatility: Gauge;
+    private marketSpread: Gauge;
+    private marketDepth: Gauge;
+    private priceMovement: Gauge;
 
     constructor(
-        private configService: ConfigService,
-        private redisService: RedisService,
-        @InjectMetric('trading_volume_total')
-        private tradingVolumeCounter: Counter<string>,
-        @InjectMetric('active_trades')
-        private activeTradesGauge: Gauge<string>,
-        @InjectMetric('trade_execution_duration')
-        private tradeExecutionHistogram: Histogram<string>,
-        @InjectMetric('system_memory_usage')
-        private memoryUsageGauge: Gauge<string>
-    ) {
-        this.influxDB = new InfluxDB({
-            url: this.configService.get('INFLUXDB_URL')!,
-            token: this.configService.get('INFLUXDB_TOKEN')!
-        });
-    }
+        private readonly prometheusService: PrometheusService,
+        private readonly configService: ConfigService,
+        private readonly redisService: RedisService,
+        private readonly auditService: AuditService
+    ) {}
 
     async onModuleInit() {
+        this.initializeMetrics();
         this.startMetricsCollection();
-        this.startMetricsFlush();
+    }
+
+    private initializeMetrics() {
+        // Trading Metrics
+        this.tradingVolume = new Counter({
+            name: 'trading_volume_total',
+            help: 'Total trading volume in base currency',
+            labelNames: ['pair', 'side']
+        });
+
+        this.tradingValue = new Counter({
+            name: 'trading_value_total',
+            help: 'Total trading value in quote currency',
+            labelNames: ['pair', 'side']
+        });
+
+        this.orderCount = new Counter({
+            name: 'order_count_total',
+            help: 'Total number of orders',
+            labelNames: ['pair', 'side', 'type', 'status']
+        });
+
+        this.profitLoss = new Gauge({
+            name: 'profit_loss_current',
+            help: 'Current profit/loss in quote currency',
+            labelNames: ['pair', 'timeframe']
+        });
+
+        this.tradingLatency = new Histogram({
+            name: 'trading_latency_seconds',
+            help: 'Trading operation latency',
+            labelNames: ['operation'],
+            buckets: [0.1, 0.5, 1, 2, 5]
+        });
+
+        // Performance Metrics
+        this.systemLoad = new Gauge({
+            name: 'system_load_average',
+            help: 'System load average',
+            labelNames: ['interval']
+        });
+
+        this.memoryUsage = new Gauge({
+            name: 'memory_usage_bytes',
+            help: 'Memory usage in bytes',
+            labelNames: ['type']
+        });
+
+        this.apiLatency = new Histogram({
+            name: 'api_latency_seconds',
+            help: 'API endpoint latency',
+            labelNames: ['endpoint', 'method'],
+            buckets: [0.05, 0.1, 0.5, 1, 2]
+        });
+
+        // Cache Metrics
+        this.cacheHits = new Counter({
+            name: 'cache_hits_total',
+            help: 'Total number of cache hits',
+            labelNames: ['cache_type']
+        });
+
+        this.cacheMisses = new Counter({
+            name: 'cache_misses_total',
+            help: 'Total number of cache misses',
+            labelNames: ['cache_type']
+        });
+
+        // Market Metrics
+        this.marketVolatility = new Gauge({
+            name: 'market_volatility',
+            help: 'Market volatility index',
+            labelNames: ['pair', 'timeframe']
+        });
+
+        this.marketSpread = new Gauge({
+            name: 'market_spread',
+            help: 'Current market spread',
+            labelNames: ['pair']
+        });
     }
 
     private startMetricsCollection() {
         // System metrics collection
-        setInterval(() => {
+        setInterval(async () => {
             this.collectSystemMetrics();
-        }, MetricsConfig.SYSTEM_METRICS_INTERVAL);
+        }, 15000); // Every 15 seconds
 
-        // Trading metrics collection
-        setInterval(() => {
-            this.collectTradingMetrics();
-        }, MetricsConfig.TRADING_METRICS_INTERVAL);
-    }
-
-    private startMetricsFlush() {
-        this.flushInterval = setInterval(() => {
-            this.flushMetricsBuffer();
-        }, MetricsConfig.METRICS_FLUSH_INTERVAL);
-    }
-
-    async recordTradeExecution(tradeData: {
-        userId: string;
-        amount: number;
-        success: boolean;
-        duration: number;
-        marketAddress: string;
-    }) {
-        const point = new Point('trade_execution')
-            .tag('user_id', tradeData.userId)
-            .tag('market', tradeData.marketAddress)
-            .tag('success', String(tradeData.success))
-            .floatField('amount', tradeData.amount)
-            .floatField('duration_ms', tradeData.duration);
-
-        this.bufferMetric('trading', point);
-
-        // Update Prometheus metrics
-        this.tradingVolumeCounter.inc(tradeData.amount);
-        this.tradeExecutionHistogram.observe(tradeData.duration);
-
-        // Update Redis cache for real-time monitoring
-        await this.updateRealTimeMetrics('trades', tradeData);
-    }
-
-    async recordMarketActivity(marketData: {
-        address: string;
-        volume24h: number;
-        price: number;
-        liquidity: number;
-    }) {
-        const point = new Point('market_activity')
-            .tag('market_address', marketData.address)
-            .floatField('volume_24h', marketData.volume24h)
-            .floatField('price', marketData.price)
-            .floatField('liquidity', marketData.liquidity);
-
-        this.bufferMetric('markets', point);
-    }
-
-    async recordUserActivity(userData: {
-        userId: string;
-        action: string;
-        success: boolean;
-        metadata?: Record<string, any>;
-    }) {
-        const point = new Point('user_activity')
-            .tag('user_id', userData.userId)
-            .tag('action', userData.action)
-            .tag('success', String(userData.success));
-
-        if (userData.metadata) {
-            Object.entries(userData.metadata).forEach(([key, value]) => {
-                if (typeof value === 'number') {
-                    point.floatField(key, value);
-                } else {
-                    point.stringField(key, String(value));
-                }
-            });
-        }
-
-        this.bufferMetric('users', point);
-    }
-
-    async recordWebhookProcessing(
-        eventType: string,
-        duration: number,
-        success: boolean
-    ) {
-        const point = new Point('webhook_processing')
-            .tag('event_type', eventType)
-            .tag('success', String(success))
-            .floatField('duration_ms', duration);
-
-        this.bufferMetric('webhooks', point);
+        // Market metrics collection
+        setInterval(async () => {
+            this.collectMarketMetrics();
+        }, 5000); // Every 5 seconds
     }
 
     private async collectSystemMetrics() {
-        const systemMetrics: SystemMetrics = {
-            memoryUsage: process.memoryUsage(),
-            cpuUsage: process.cpuUsage(),
-            activeConnections: await this.getActiveConnections(),
-            queueSizes: await this.getQueueSizes()
-        };
-
-        const point = new Point('system_metrics')
-            .floatField('memory_used', systemMetrics.memoryUsage.heapUsed)
-            .floatField('memory_total', systemMetrics.memoryUsage.heapTotal)
-            .floatField('cpu_user', systemMetrics.cpuUsage.user)
-            .floatField('cpu_system', systemMetrics.cpuUsage.system)
-            .intField('active_connections', systemMetrics.activeConnections);
-
-        this.bufferMetric('system', point);
-        this.memoryUsageGauge.set(systemMetrics.memoryUsage.heapUsed);
-    }
-
-    private async collectTradingMetrics() {
-        const tradingMetrics: TradingMetrics = {
-            activeTrades: await this.getActiveTrades(),
-            pendingOrders: await this.getPendingOrders(),
-            tradingVolume24h: await this.getTradingVolume24h()
-        };
-
-        const point = new Point('trading_metrics')
-            .intField('active_trades', tradingMetrics.activeTrades)
-            .intField('pending_orders', tradingMetrics.pendingOrders)
-            .floatField('volume_24h', tradingMetrics.tradingVolume24h);
-
-        this.bufferMetric('trading', point);
-        this.activeTradesGauge.set(tradingMetrics.activeTrades);
-    }
-
-    private bufferMetric(category: string, point: Point) {
-        if (!this.metricsBuffer.has(category)) {
-            this.metricsBuffer.set(category, []);
-        }
-        this.metricsBuffer.get(category)!.push(point);
-
-        // Flush if buffer size exceeds threshold
-        if (this.metricsBuffer.get(category)!.length >= MetricsConfig.BUFFER_SIZE_THRESHOLD) {
-            this.flushMetricsBuffer(category);
-        }
-    }
-
-    private async flushMetricsBuffer(category?: string) {
-        const writeApi = this.influxDB.getWriteApi(
-            this.configService.get('INFLUXDB_ORG')!,
-            this.configService.get('INFLUXDB_BUCKET')!
-        );
-
         try {
-            const categories = category ? [category] : Array.from(this.metricsBuffer.keys());
-            
-            for (const cat of categories) {
-                const points = this.metricsBuffer.get(cat) || [];
-                if (points.length > 0) {
-                    writeApi.writePoints(points);
-                    this.metricsBuffer.set(cat, []);
-                }
-            }
+            const memStats = process.memoryUsage();
+            this.memoryUsage.set({ type: 'heapUsed' }, memStats.heapUsed);
+            this.memoryUsage.set({ type: 'heapTotal' }, memStats.heapTotal);
+            this.memoryUsage.set({ type: 'rss' }, memStats.rss);
 
-            await writeApi.close();
+            const loadAvg = require('os').loadavg();
+            this.systemLoad.set({ interval: '1m' }, loadAvg[0]);
+            this.systemLoad.set({ interval: '5m' }, loadAvg[1]);
+            this.systemLoad.set({ interval: '15m' }, loadAvg[2]);
         } catch (error) {
-            console.error('Failed to flush metrics buffer:', error);
+            await this.auditService.logSystemEvent({
+                event: 'METRICS_COLLECTION_ERROR',
+                details: { error: error.message },
+                severity: 'ERROR'
+            });
         }
     }
 
-    private async updateRealTimeMetrics(
-        category: string,
-        data: Record<string, any>
-    ) {
-        const key = `metrics:realtime:${category}`;
-        await this.redisService.lpush(key, JSON.stringify({
-            timestamp: Date.now(),
-            ...data
-        }));
-        await this.redisService.ltrim(key, 0, MetricsConfig.REALTIME_METRICS_LIMIT - 1);
+    // Trading Metrics Methods
+    async recordTrade(params: {
+        pair: string;
+        side: 'buy' | 'sell';
+        volume: number;
+        value: number;
+        latency: number;
+    }) {
+        this.tradingVolume.inc({ pair: params.pair, side: params.side }, params.volume);
+        this.tradingValue.inc({ pair: params.pair, side: params.side }, params.value);
+        this.tradingLatency.observe({ operation: 'execute_trade' }, params.latency);
     }
 
-    private async getActiveConnections(): Promise<number> {
-        return parseInt(await this.redisService.get('metrics:active_connections') || '0');
+    async recordOrder(params: {
+        pair: string;
+        side: 'buy' | 'sell';
+        type: 'market' | 'limit';
+        status: 'created' | 'filled' | 'cancelled';
+    }) {
+        this.orderCount.inc({
+            pair: params.pair,
+            side: params.side,
+            type: params.type,
+            status: params.status
+        });
     }
 
-    private async getQueueSizes(): Promise<Record<string, number>> {
-        const queues = ['trades', 'orders', 'webhooks'];
-        const sizes: Record<string, number> = {};
-        
-        for (const queue of queues) {
-            sizes[queue] = parseInt(
-                await this.redisService.get(`queue:${queue}:size`) || '0'
-            );
+    async updateProfitLoss(pair: string, value: number, timeframe: string) {
+        this.profitLoss.set({ pair, timeframe }, value);
+    }
+
+    // Performance Metrics Methods
+    async recordApiLatency(endpoint: string, method: string, latency: number) {
+        this.apiLatency.observe({ endpoint, method }, latency);
+    }
+
+    async incrementError(type: string) {
+        this.errorRate.inc({ type });
+    }
+
+    // Cache Metrics Methods
+    async recordCacheOperation(operation: string, latency?: number) {
+        if (latency) {
+            this.cacheLatency.observe({ operation }, latency);
         }
-        
-        return sizes;
     }
 
-    private async getActiveTrades(): Promise<number> {
-        return parseInt(await this.redisService.get('metrics:active_trades') || '0');
+    async recordCacheHit(cacheType: 'local' | 'redis') {
+        this.cacheHits.inc({ cache_type: cacheType });
     }
 
-    private async getPendingOrders(): Promise<number> {
-        return parseInt(await this.redisService.get('metrics:pending_orders') || '0');
+    async recordCacheMiss() {
+        this.cacheMisses.inc();
     }
 
-    private async getTradingVolume24h(): Promise<number> {
-        return parseFloat(await this.redisService.get('metrics:trading_volume_24h') || '0');
+    // Market Metrics Methods
+    private async collectMarketMetrics() {
+        try {
+            // Implement market metrics collection
+            // This would be updated with actual market data from your trading system
+            const pairs = this.configService.get<string[]>('TRADING_PAIRS');
+            
+            for (const pair of pairs) {
+                // These would be actual values from your market data service
+                const volatility = await this.calculateVolatility(pair);
+                const spread = await this.calculateSpread(pair);
+                const depth = await this.calculateMarketDepth(pair);
+
+                this.marketVolatility.set({ pair, timeframe: '5m' }, volatility);
+                this.marketSpread.set({ pair }, spread);
+                this.marketDepth.set({ pair }, depth);
+            }
+        } catch (error) {
+            await this.auditService.logSystemEvent({
+                event: 'MARKET_METRICS_COLLECTION_ERROR',
+                details: { error: error.message },
+                severity: 'ERROR'
+            });
+        }
+    }
+
+    private async calculateVolatility(pair: string): Promise<number> {
+        // Implement volatility calculation
+        // This would use your market data service to get price history
+        // and calculate standard deviation of returns
+        return 0;
+    }
+
+    private async calculateSpread(pair: string): Promise<number> {
+        // Implement spread calculation
+        // This would get current bid/ask from your market data service
+        return 0;
+    }
+
+    private async calculateMarketDepth(pair: string): Promise<number> {
+        // Implement market depth calculation
+        // This would aggregate order book data from your market data service
+        return 0;
+    }
+
+    // Utility Methods
+    async getMetricsSummary(): Promise<any> {
+        return {
+            trading: {
+                volume: await this.tradingVolume.get(),
+                orders: await this.orderCount.get(),
+                profitLoss: await this.profitLoss.get()
+            },
+            performance: {
+                systemLoad: await this.systemLoad.get(),
+                memoryUsage: await this.memoryUsage.get(),
+                errorRate: await this.errorRate.get()
+            },
+            cache: {
+                hits: await this.cacheHits.get(),
+                misses: await this.cacheMisses.get()
+            },
+            market: {
+                volatility: await this.marketVolatility.get(),
+                spread: await this.marketSpread.get()
+            }
+        };
     }
 }
