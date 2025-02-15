@@ -1,38 +1,67 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { Wallet, WalletDocument } from '../../database/schemas/Wallet.schema';
+import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { Token, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import * as anchor from '@project-serum/anchor';
 import { KeyManagementService } from '../encryption/KeyManagementService';
-import { ConfigService } from '@nestjs/config';
-import { Connection } from '@solana/web3.js';
-import { createHash } from 'crypto';
-import * as bs58 from 'bs58';
+import { MarketService } from '../market/MarketService';
+import { RedisService } from '../cache/RedisService';
+import { Wallet } from '../../database/schemas/Wallet.schema';
+import { SOLANA_NETWORK_CONFIG } from '../../config/constants';
+import { WalletBalance, TokenBalance } from '../../types/wallet.types';
 
 @Injectable()
-export class WalletService {
-    private readonly solanaConnection: Connection;
+export class WalletService implements OnModuleInit {
+    private readonly logger = new Logger(WalletService.name);
+    private connection: Connection;
+    private provider: anchor.Provider;
+    private balanceUpdateInterval: NodeJS.Timeout;
 
     constructor(
-        @InjectModel(Wallet.name) private walletModel: Model<WalletDocument>,
-        private readonly keyManagementService: KeyManagementService,
-        private readonly configService: ConfigService
+        @InjectModel(Wallet.name) private walletModel: Model<Wallet>,
+        private keyManagementService: KeyManagementService,
+        private marketService: MarketService,
+        private redisService: RedisService,
+        private configService: ConfigService
     ) {
-        this.solanaConnection = new Connection(
-            this.configService.get<string>('SOLANA_RPC_URL')!,
-            'confirmed'
+        this.connection = new Connection(
+            SOLANA_NETWORK_CONFIG.RPC_ENDPOINTS[0],
+            SOLANA_NETWORK_CONFIG.COMMITMENT
+        );
+        this.provider = new anchor.Provider(
+            this.connection,
+            {} as any,
+            { commitment: SOLANA_NETWORK_CONFIG.COMMITMENT }
         );
     }
 
-    async createWallet(userId: string, metadata?: { name?: string; tags?: string[] }): Promise<Wallet> {
-        const activeWallets = await this.getActiveWalletsCount(userId);
-        const maxWallets = this.configService.get<number>('MAX_WALLETS_PER_USER') || 3;
-        
-        if (activeWallets >= maxWallets) {
-            throw new BadRequestException(`Maximum number of active wallets (${maxWallets}) reached`);
-        }
+    async onModuleInit() {
+        this.startBalanceUpdateService();
+    }
 
-        const { publicKey, privateKey } = await this.keyManagementService.generateWallet();
-        const encryptedPrivateKey = await this.keyManagementService.encryptPrivateKey(privateKey, userId);
+    private startBalanceUpdateService() {
+        this.balanceUpdateInterval = setInterval(async () => {
+            try {
+                const activeWallets = await this.walletModel.find({ isActive: true });
+                for (const wallet of activeWallets) {
+                    await this.updateWalletBalances(wallet);
+                }
+            } catch (error) {
+                this.logger.error('Failed to update wallet balances', error);
+            }
+        }, 30000); // Update every 30 seconds
+    }
+
+    async createWallet(userId: string, metadata?: { name?: string; tags?: string[] }): Promise<Wallet> {
+        const keypair = Keypair.generate();
+        const publicKey = keypair.publicKey.toString();
+        const privateKey = Buffer.from(keypair.secretKey).toString('base64');
+
+        const encryptedPrivateKey = await this.keyManagementService.encryptPrivateKey(
+            privateKey,
+            userId
+        );
 
         const wallet = new this.walletModel({
             userId,
@@ -41,19 +70,26 @@ export class WalletService {
             origin: 'created',
             metadata: {
                 ...metadata,
-                createdFrom: 'platform'
+                createdAt: new Date(),
+                lastBackup: new Date()
             },
+            balances: {
+                solana: 0,
+                tokens: []
+            },
+            authorizedIps: [],
+            isActive: true,
+            lastUsed: new Date(),
+            tradingVolume: 0,
+            dailyTradeCount: 0,
             lastDailyReset: new Date()
         });
 
-        try {
-            return await wallet.save();
-        } catch (error) {
-            if (error.code === 11000) { // Duplicate key error
-                throw new ConflictException('Wallet already exists');
-            }
-            throw error;
-        }
+        await wallet.save();
+        await this.createAssociatedTokenAccounts(keypair);
+        await this.updateWalletBalances(wallet);
+
+        return wallet;
     }
 
     async importWallet(
@@ -62,31 +98,27 @@ export class WalletService {
         metadata?: { name?: string; tags?: string[] }
     ): Promise<Wallet> {
         if (!this.keyManagementService.validatePrivateKey(privateKey)) {
-            throw new BadRequestException('Invalid private key');
+            throw new Error('Invalid private key format');
         }
 
-        const activeWallets = await this.getActiveWalletsCount(userId);
-        const maxWallets = this.configService.get<number>('MAX_WALLETS_PER_USER') || 3;
-        
-        if (activeWallets >= maxWallets) {
-            throw new BadRequestException(`Maximum number of active wallets (${maxWallets}) reached`);
-        }
+        const keypair = Keypair.fromSecretKey(
+            Buffer.from(privateKey, 'base64')
+        );
 
-        const web3 = require('@solana/web3.js');
-        const keypair = web3.Keypair.fromSecretKey(Buffer.from(privateKey, 'base64'));
         const publicKey = keypair.publicKey.toString();
-
-        // Check if wallet already exists
         const existingWallet = await this.walletModel.findOne({ 
             userId, 
             publicKey 
         });
 
         if (existingWallet) {
-            throw new ConflictException('Wallet already imported');
+            throw new Error('Wallet already exists for this user');
         }
 
-        const encryptedPrivateKey = await this.keyManagementService.encryptPrivateKey(privateKey, userId);
+        const encryptedPrivateKey = await this.keyManagementService.encryptPrivateKey(
+            privateKey,
+            userId
+        );
 
         const wallet = new this.walletModel({
             userId,
@@ -95,99 +127,144 @@ export class WalletService {
             origin: 'imported',
             metadata: {
                 ...metadata,
-                createdFrom: 'import'
+                createdAt: new Date(),
+                lastBackup: new Date()
             },
+            balances: {
+                solana: 0,
+                tokens: []
+            },
+            authorizedIps: [],
+            isActive: true,
+            lastUsed: new Date(),
+            tradingVolume: 0,
+            dailyTradeCount: 0,
             lastDailyReset: new Date()
         });
 
-        return await wallet.save();
-    }
-
-    async getWallet(userId: string, publicKey: string): Promise<Wallet> {
-        const wallet = await this.walletModel.findOne({ 
-            userId, 
-            publicKey,
-            isActive: true 
-        });
-
-        if (!wallet) {
-            throw new NotFoundException('Wallet not found');
-        }
+        await wallet.save();
+        await this.updateWalletBalances(wallet);
 
         return wallet;
     }
 
-    async getWalletPrivateKey(userId: string, publicKey: string): Promise<string> {
-        const wallet = await this.getWallet(userId, publicKey);
-        return this.keyManagementService.decryptPrivateKey(wallet.encryptedPrivateKey, userId);
-    }
+    private async createAssociatedTokenAccounts(keypair: Keypair) {
+        const tokens = await this.marketService.getActiveTokens();
+        
+        for (const token of tokens) {
+            try {
+                const mint = new PublicKey(token.mintAddress);
+                const tokenInstance = new Token(
+                    this.connection,
+                    mint,
+                    TOKEN_PROGRAM_ID,
+                    keypair
+                );
 
-    async deactivateWallet(userId: string, publicKey: string): Promise<void> {
-        const result = await this.walletModel.updateOne(
-            { userId, publicKey, isActive: true },
-            { 
-                $set: { 
-                    isActive: false,
-                    lastUsed: new Date()
-                } 
+                await tokenInstance.getOrCreateAssociatedAccountInfo(
+                    keypair.publicKey
+                );
+            } catch (error) {
+                this.logger.error(
+                    `Failed to create associated token account for ${token.symbol}`,
+                    error
+                );
             }
-        );
-
-        if (result.modifiedCount === 0) {
-            throw new NotFoundException('Active wallet not found');
         }
     }
 
-    async updateWalletMetadata(
-        userId: string, 
-        publicKey: string, 
-        metadata: { name?: string; tags?: string[] }
-    ): Promise<Wallet> {
-        const wallet = await this.getWallet(userId, publicKey);
-        wallet.metadata = { ...wallet.metadata, ...metadata };
-        return await wallet.save();
-    }
+    async updateWalletBalances(wallet: Wallet): Promise<void> {
+        const publicKey = new PublicKey(wallet.publicKey);
 
-    async resetDailyLimits(): Promise<void> {
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
+        try {
+            const solanaBalance = await this.connection.getBalance(publicKey);
+            const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                publicKey,
+                { programId: TOKEN_PROGRAM_ID }
+            );
 
-        await this.walletModel.updateMany(
-            { lastDailyReset: { $lt: yesterday } },
-            { 
-                $set: { 
-                    dailyTradeCount: 0,
-                    lastDailyReset: new Date()
-                } 
+            const tokenBalances: TokenBalance[] = [];
+            for (const { account, pubkey } of tokenAccounts.value) {
+                const parsedInfo = account.data.parsed.info;
+                const tokenBalance = {
+                    mint: parsedInfo.mint,
+                    balance: Number(parsedInfo.tokenAmount.amount),
+                    decimals: parsedInfo.tokenAmount.decimals,
+                    associatedTokenAddress: pubkey.toString()
+                };
+
+                const cacheKey = `balance:${wallet.publicKey}:${parsedInfo.mint}`;
+                await this.redisService.set(cacheKey, JSON.stringify(tokenBalance), 300);
+                tokenBalances.push(tokenBalance);
             }
-        );
+
+            await this.walletModel.updateOne(
+                { _id: wallet._id },
+                { 
+                    $set: { 
+                        'balances.solana': solanaBalance,
+                        'balances.tokens': tokenBalances,
+                        'lastBalanceUpdate': new Date()
+                    }
+                }
+            );
+        } catch (error) {
+            this.logger.error(
+                `Failed to update balances for wallet ${wallet.publicKey}`,
+                error
+            );
+        }
     }
 
-    private async getActiveWalletsCount(userId: string): Promise<number> {
-        return await this.walletModel.countDocuments({ 
+    async getWalletBalances(userId: string, publicKey: string): Promise<WalletBalance> {
+        const wallet = await this.walletModel.findOne({ 
             userId, 
-            isActive: true 
+            publicKey,
+            isActive: true
         });
-    }
 
-    async validateWalletAccess(userId: string, publicKey: string, clientIp: string): Promise<boolean> {
-        const wallet = await this.getWallet(userId, publicKey);
-        
-        if (!wallet.authorizedIps.includes(clientIp)) {
-            // Log unauthorized access attempt
-            console.warn(`Unauthorized wallet access attempt from IP ${clientIp} for wallet ${publicKey}`);
-            return false;
+        if (!wallet) {
+            throw new Error('Wallet not found');
         }
 
-        return true;
+        const cachedBalances = await this.getCachedBalances(publicKey);
+        if (cachedBalances) {
+            return cachedBalances;
+        }
+
+        await this.updateWalletBalances(wallet);
+        return wallet.balances;
     }
 
-    async authorizeIp(userId: string, publicKey: string, ip: string): Promise<void> {
-        const wallet = await this.getWallet(userId, publicKey);
+    private async getCachedBalances(publicKey: string): Promise<WalletBalance | null> {
+        const solanaBalanceKey = `balance:${publicKey}:solana`;
+        const solanaBalance = await this.redisService.get(solanaBalanceKey);
+
+        if (!solanaBalance) {
+            return null;
+        }
+
+        const tokenBalances: TokenBalance[] = [];
+        const tokenKeys = await this.redisService.keys(`balance:${publicKey}:*`);
         
-        if (!wallet.authorizedIps.includes(ip)) {
-            wallet.authorizedIps.push(ip);
-            await wallet.save();
+        for (const key of tokenKeys) {
+            if (key !== solanaBalanceKey) {
+                const tokenBalance = await this.redisService.get(key);
+                if (tokenBalance) {
+                    tokenBalances.push(JSON.parse(tokenBalance));
+                }
+            }
+        }
+
+        return {
+            solana: Number(solanaBalance),
+            tokens: tokenBalances
+        };
+    }
+
+    async onDestroy() {
+        if (this.balanceUpdateInterval) {
+            clearInterval(this.balanceUpdateInterval);
         }
     }
 }
