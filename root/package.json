@@ -30,6 +30,12 @@
     "stripe": "^14.14.0",
     "ws": "^8.16.0",
     "zod": "^3.22.4"
+    "@aws-sdk/client-kms": "^3.x.x",
+    "@nestjs/common": "^9.x.x",
+    "@nestjs/config": "^2.x.x",
+    "@types/node": "^18.x.x"
+  }
+}
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
