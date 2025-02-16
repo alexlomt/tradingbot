@@ -1,8 +1,46 @@
-import { PublicKey, TransactionMessage, VersionedTransaction, Commitment } from '@solana/web3.js';
+import { PublicKey, Keypair } from '@solana/web3.js';
 import { Token, TokenAmount, Percent } from '@raydium-io/raydium-sdk';
 import { BN } from 'bn.js';
 
-// Subscription System Types
+// Core Trading Types
+export interface TradingPair {
+    lpAddress: PublicKey;
+    baseToken: Token;
+    quoteToken: Token;
+    baseAmount: TokenAmount;
+    quoteAmount: TokenAmount;
+    lpToken?: Token;
+}
+
+export interface MarketState {
+    price: BN;
+    liquidity: BN;
+    volume24h: BN;
+    lastUpdate: Date;
+    isActive: boolean;
+    volatility24h?: Percent;
+    priceChange24h?: Percent;
+}
+
+// Subscription System
+export interface UserSubscription {
+    userId: string;
+    planId: string;
+    active: boolean;
+    startDate: Date;
+    endDate: Date;
+    features: {
+        priority: boolean;
+        maxPositions: number;
+        customStrategies: boolean;
+    };
+    tradingStats: {
+        dailyTradeCount: number;
+        lastTradingDay: Date;
+        totalVolume: BN;
+    };
+}
+
 export interface SubscriptionPlan {
     id: string;
     name: string;
@@ -10,70 +48,55 @@ export interface SubscriptionPlan {
     duration: number;
     features: string[];
     maxPositions: number;
-    allowedPairs: string[];
-    priority: boolean;
     maxDailyTrades: number;
-    maxConcurrentTrades: number;
+    priority: boolean;
+    allowedPairs: string[];
     customStrategySupport: boolean;
 }
 
-export interface UserSubscription {
-    userId: string;
-    planId: string;
-    startDate: Date;
-    endDate: Date;
-    active: boolean;
-    paymentHistory: PaymentRecord[];
-    features: {
-        maxPositions: number;
-        allowedPairs: string[];
-        priority: boolean;
-        maxDailyTrades: number;
-        maxConcurrentTrades: number;
-        customStrategySupport: boolean;
-    };
-    tradingStats: {
-        dailyTradeCount: number;
-        lastTradingDay: Date;
-        totalTradeCount: number;
-        activePositions: number;
-    };
+export interface TradingPermissions {
+    canTrade: boolean;
+    maxPositions: number;
+    allowedPairs: string[];
+    priorityExecution: boolean;
+    subscriptionValid: boolean;
+    remainingDailyTrades: number;
+    customStrategiesAllowed: boolean;
 }
 
-export interface PaymentRecord {
-    id: string;
-    amount: number;
-    date: Date;
-    status: 'pending' | 'completed' | 'failed';
-    transactionId?: string;
-    planId: string;
-    currency: string;
-    paymentMethod: string;
-}
+// Transaction and Execution
+export type ExecutionStrategy = 'default' | 'warp' | 'jito';
 
-// Trading System Types
 export interface TransactionConfig {
-    computeUnitLimit: number;
-    computeUnitPrice: number;
-    retryCount: number;
-    confirmationStrategy: Commitment;
-    priorityFee?: number;
     warpEnabled?: boolean;
     jitoEnabled?: boolean;
-    maxTimeout?: number;
+    priorityFee?: number;
+    computeUnitLimit?: number;
+    computeUnitPrice?: number;
     skipPreflight?: boolean;
-    subscriberPriority?: boolean;
+    maxTimeout?: number;
+    maxRetries?: number;
+    metadata?: Record<string, any>;
 }
 
-export interface TradingPair {
-    baseToken: Token;
-    quoteToken: Token;
-    baseAmount: TokenAmount;
-    quoteAmount: TokenAmount;
-    lpAddress: PublicKey;
-    marketId: string;
-    minLotSize: BN;
-    tickSize: BN;
+export interface TransactionResult {
+    signature?: string;
+    success: boolean;
+    error?: string;
+    blockTime?: number;
+    fee?: number;
+    confirmations?: number;
+    slot?: number;
+}
+
+// Trading Context and Configuration
+export interface TradeExecutionContext {
+    pair: TradingPair;
+    side: 'buy' | 'sell';
+    userSubscription: UserSubscription;
+    slippage: Percent;
+    deadline?: number;
+    metadata?: Record<string, any>;
 }
 
 export interface TradingStrategyConfig {
@@ -81,7 +104,7 @@ export interface TradingStrategyConfig {
     autoSellDelay: number;
     takeProfit: Percent;
     stopLoss: Percent;
-    trailingStop?: Percent;
+    trailingStop: Percent;
     slippageTolerance: Percent;
     priceCheckInterval: number;
     priceCheckDuration: number;
@@ -93,14 +116,16 @@ export interface TradingStrategyConfig {
     riskManagement: RiskManagementConfig;
 }
 
+// Risk Management
 export interface RiskManagementConfig {
     maxDailyLoss: Percent;
-    maxPositionSize: TokenAmount;
+    maxPositionSize: BN;
     maxLeverage: number;
     dailyVolumeLimit: BN;
     emergencyCloseThreshold: Percent;
 }
 
+// Pool Configuration
 export interface PoolConfig {
     minSize: BN;
     maxSize: BN;
@@ -114,74 +139,90 @@ export interface PoolConfig {
     volumeThreshold: BN;
 }
 
-export interface TransactionResult {
-    signature: string;
-    success: boolean;
-    error?: string;
-    blockTime?: number;
-    fee?: number;
-    slot?: number;
-    confirmations?: number;
-    executionTime?: number;
+// Token Management
+export interface TokenPairConfig {
+    wsol: {
+        address: string;
+        decimals: number;
+    };
+    usdc: {
+        address: string;
+        decimals: number;
+    };
+    defaultSlippage: number;
 }
 
-export interface TradeExecutionContext {
-    pair: TradingPair;
-    side: 'buy' | 'sell';
-    amount: TokenAmount;
-    slippage: Percent;
+// Events
+export interface MarketEvent {
+    type: 'market:update' | 'pool:new' | 'wallet:update';
+    address: PublicKey;
+    data: any;
     timestamp: Date;
-    txConfig: TransactionConfig;
-    userSubscription?: UserSubscription;
-    strategy?: string;
-    positionId?: string;
-    metadata?: Record<string, any>;
-}
-
-export interface MarketState {
-    price: BN;
-    liquidity: BN;
-    volume24h: BN;
-    lastUpdate: Date;
-    isActive: boolean;
-    volatility24h?: Percent;
-    priceChange24h?: Percent;
-    marketCap?: BN;
-    totalTrades24h?: number;
-}
-
-export type TransactionExecutor = (
-    transaction: VersionedTransaction,
-    config: TransactionConfig,
-    subscription?: UserSubscription
-) => Promise<TransactionResult>;
-
-export interface TradingPermissions {
-    canTrade: boolean;
-    maxPositions: number;
-    allowedPairs: string[];
-    priorityExecution: boolean;
-    subscriptionValid: boolean;
-    remainingDailyTrades: number;
-    customStrategiesAllowed: boolean;
 }
 
 export interface SubscriptionEvent {
-    type: 'subscription-created' | 'subscription-updated' | 'subscription-expired' | 'payment-received';
+    type: 'subscription-expired' | 'subscription-renewed' | 'subscription-cancelled';
     userId: string;
     planId: string;
     timestamp: Date;
-    details: Partial<UserSubscription>;
+    details: UserSubscription;
 }
 
-export type SubscriptionEventHandler = (event: SubscriptionEvent) => Promise<void>;
-
 export interface TradeEvent {
-    type: 'trade-executed' | 'trade-failed' | 'position-closed';
-    userId: string;
-    tradeContext: TradeExecutionContext;
+    type: 'trade:executed' | 'trade:failed' | 'position:closed';
+    context: TradeExecutionContext;
     result: TransactionResult;
     timestamp: Date;
 }
 
-export type TradeEventHandler = (event: TradeEvent) => Promise<void>;
+// Database Models
+export interface DatabaseConfig {
+    uri: string;
+    options: {
+        useNewUrlParser: boolean;
+        useUnifiedTopology: boolean;
+        maxPoolSize: number;
+    };
+}
+
+// Service Interfaces
+export interface IMarketDataService {
+    getMarketState(lpAddress: PublicKey): Promise<MarketState>;
+    subscribeToMarketUpdates(lpAddress: PublicKey, callback: (state: MarketState) => void): Promise<() => void>;
+    getMarketSummary(pair: TradingPair): Promise<{
+        currentPrice: BN;
+        priceChange24h: Percent;
+        volume24h: BN;
+        liquidity: BN;
+        volatility24h?: Percent;
+    }>;
+}
+
+export interface IPoolAnalyzer {
+    validatePool(lpAddress: PublicKey): Promise<boolean>;
+    getPoolKeys(lpAddress: PublicKey): Promise<any>;
+    getPoolState(lpAddress: PublicKey): Promise<any>;
+}
+
+export interface IRiskManager {
+    validateTrade(context: TradeExecutionContext): Promise<boolean>;
+    shouldClosePosition(position: TradeExecutionContext, update: { marketState: MarketState; pnlPercent: Percent }): Promise<boolean>;
+    updateRiskMetrics(userId: string, update: { loss?: BN; volume?: BN; isLoss?: boolean }): void;
+}
+
+// Cache Keys
+export type CacheKey = string;
+export type CacheValue = any;
+
+// Error Types
+export interface ErrorContext {
+    context: string;
+    timestamp: Date;
+    details: Record<string, any>;
+}
+
+export interface ErrorReport extends Error {
+    context: ErrorContext;
+    timestamp: Date;
+    severity: 'low' | 'medium' | 'high' | 'critical';
+}
