@@ -90,3 +90,20 @@ export const PROGRAM_IDS = {
     COMPUTE_BUDGET_PROGRAM: new PublicKey('ComputeBudget111111111111111111111111111111'),
     LOOKUP_TABLE_PROGRAM: new PublicKey('AddressLookupTab1e1111111111111111111111111')
 };
+
+export const SECURITY_CONFIG = {
+    SALT_LENGTH: 32,
+    IV_LENGTH: 16,
+    AUTH_TAG_LENGTH: 16,
+    ENCRYPTION_ALGORITHM: 'aes-256-gcm',
+    KEY_ROTATION_INTERVAL: 90 * 24 * 60 * 60 * 1000, // 90 days
+    KEY_CACHE_DURATION: 24 * 60 * 60 * 1000, // 24 hours
+    HASH_ALGORITHM: 'sha256',
+    SCRYPT_PARAMS: {
+        N: 32768,
+        r: 8,
+        p: 1,
+        maxmem: 64 * 1024 * 1024,
+    },
+    KEY_SIZE: 32,
+};
