@@ -3,6 +3,7 @@ import {
     Keypair,
     PublicKey,
     TransactionInstruction,
+    VersionedTransaction
 } from '@solana/web3.js';
 import {
     Liquidity,
@@ -10,7 +11,8 @@ import {
     TokenAmount,
     ZERO,
     Percent,
-    Currency
+    Currency,
+    LiquidityPoolKeysV4
 } from '@raydium-io/raydium-sdk';
 import {
     TradingStrategyConfig,
@@ -19,7 +21,9 @@ import {
     MarketState,
     UserSubscription,
     TradeEvent,
-    RiskManagementConfig
+    RiskManagementConfig,
+    TransactionConfig,
+    TransactionResult
 } from '../types/trading.types';
 import { TransactionManager } from './TransactionManager';
 import { PoolAnalyzer } from './PoolAnalyzer';
@@ -31,8 +35,14 @@ import { TokenValidator } from '../utils/TokenValidator';
 import { SubscriptionValidator } from '../services/SubscriptionValidator';
 import { MarketDataService } from '../services/MarketDataService';
 import { RiskManager } from '../services/RiskManager';
+import { TokenPairService } from '../services/TokenPairService';
+import { ExecutionStrategyService } from '../services/ExecutionStrategyService';
+import { PoolFilterService } from '../services/PoolFilterService';
+import { MarketEventService } from '../services/MarketEventService';
+import { SnipeListService } from '../services/SnipeListService';
 import BN from 'bn.js';
 import { EventEmitter } from 'events';
+import { TOKEN_PROGRAM_ID, AccountLayout, createAssociatedTokenAccountIdempotentInstruction } from '@solana/spl-token';
 
 export class TradingEngine extends EventEmitter {
     private readonly mutex: Mutex;
@@ -44,7 +54,9 @@ export class TradingEngine extends EventEmitter {
         pnl: BN;
         lastReset: Date;
     }>;
+    private readonly executionTimes: Map<string, number>;
     private isRunning: boolean = false;
+    private sellExecutionCount: number = 0;
 
     constructor(
         private readonly connection: Connection,
@@ -55,13 +67,19 @@ export class TradingEngine extends EventEmitter {
         private readonly subscriptionValidator: SubscriptionValidator,
         private readonly marketDataService: MarketDataService,
         private readonly riskManager: RiskManager,
-        private readonly tokenValidator: TokenValidator
+        private readonly tokenValidator: TokenValidator,
+        private readonly tokenPairService: TokenPairService,
+        private readonly executionService: ExecutionStrategyService,
+        private readonly poolFilterService: PoolFilterService,
+        private readonly marketEventService: MarketEventService,
+        private readonly snipeListService: SnipeListService
     ) {
         super();
         this.mutex = new Mutex();
         this.activePositions = new Map();
         this.positionMonitors = new Map();
         this.dailyStats = new Map();
+        this.executionTimes = new Map();
         this.initializeEventListeners();
     }
 
@@ -70,6 +88,22 @@ export class TradingEngine extends EventEmitter {
         this.on('position:update', this.handlePositionUpdate.bind(this));
         this.on('risk:alert', this.handleRiskAlert.bind(this));
         this.txManager.addTradeEventHandler(this.handleTradeEvent.bind(this));
+
+        this.marketEventService.on('market:update', async (event) => {
+            try {
+                await this.handleMarketUpdate(event);
+            } catch (error) {
+                logger.error('Error handling market update:', error);
+            }
+        });
+
+        this.marketEventService.on('pool:new', async (event) => {
+            try {
+                await this.handleNewPool(event);
+            } catch (error) {
+                logger.error('Error handling new pool:', error);
+            }
+        });
     }
 
     async start(): Promise<void> {
@@ -81,9 +115,19 @@ export class TradingEngine extends EventEmitter {
         try {
             await this.validateSystemState();
             this.isRunning = true;
+
+            await this.marketEventService.start({
+                walletPublicKey: this.wallet.publicKey,
+                quoteToken: this.tokenPairService.USDC,
+                autoSell: true,
+                cacheNewMarkets: true,
+                startTimestamp: Math.floor(Date.now() / 1000)
+            });
+
             await this.startTradingLoop();
             logger.info('Trading engine started successfully');
         } catch (error) {
+            this.isRunning = false;
             logger.error('Failed to start trading engine:', error);
             throw error;
         }
@@ -91,10 +135,15 @@ export class TradingEngine extends EventEmitter {
 
     async stop(): Promise<void> {
         this.isRunning = false;
+        this.marketEventService.stop();
+        
         for (const [address, monitor] of this.positionMonitors) {
             clearInterval(monitor);
             this.positionMonitors.delete(address);
         }
+        
+        await this.closeAllPositions();
+        this.removeAllListeners();
         logger.info('Trading engine stopped');
     }
 
@@ -106,21 +155,24 @@ export class TradingEngine extends EventEmitter {
         const release = await this.mutex.acquire();
 
         try {
-            // Validate subscription and trading permissions
             const permissions = await this.subscriptionValidator.validateTrading(userId, pair);
             if (!permissions.canTrade) {
                 logger.warn(`User ${userId} does not have permission to trade ${pair.baseToken.symbol}`);
                 return false;
             }
 
-            // Check daily trading limits
+            if (this.config.useSnipeList && 
+                !this.snipeListService.isTokenInSnipeList(pair.baseToken.mint)) {
+                logger.debug('Token not in snipe list');
+                return false;
+            }
+
             const dailyStats = this.getDailyStats(userId);
             if (dailyStats.trades >= permissions.remainingDailyTrades) {
                 logger.warn(`Daily trade limit reached for user ${userId}`);
                 return false;
             }
 
-            // Validate token and pool
             if (!(await this.validateTradePrerequisites(pair, userId))) {
                 return false;
             }
@@ -138,17 +190,24 @@ export class TradingEngine extends EventEmitter {
                 ...context
             };
 
-            // Risk check
             if (!await this.riskManager.validateTrade(executionContext)) {
                 logger.warn('Trade rejected by risk management');
                 return false;
             }
 
+            const poolKeys = await this.poolAnalyzer.getPoolKeys(pair.lpAddress);
+            if (!await this.poolFilterService.validatePool(pair.lpAddress, poolKeys)) {
+                logger.warn('Pool validation failed');
+                return false;
+            }
+
             const instructions = await this.buildBuyInstructions(executionContext);
-            const result = await this.txManager.executeTransaction(
-                instructions,
-                executionContext.txConfig,
-                subscription
+            const transaction = await this.txManager.createTransaction(instructions);
+
+            const result = await this.executionService.executeTransaction(
+                transaction,
+                this.wallet,
+                executionContext.txConfig
             );
 
             if (result.success) {
@@ -192,11 +251,30 @@ export class TradingEngine extends EventEmitter {
                 ...context
             };
 
-            const instructions = await this.buildSellInstructions(executionContext);
-            const result = await this.txManager.executeTransaction(
-                instructions,
-                executionContext.txConfig,
-                subscription
+            const baseBalance = await this.tokenPairService.getTokenBalance(
+                position.pair.baseToken,
+                this.wallet.publicKey
+            );
+
+            if (baseBalance.raw.eq(ZERO)) {
+                logger.debug('No balance to sell');
+                return false;
+            }
+
+            const instructions = await this.buildSellInstructions({
+                ...executionContext,
+                pair: {
+                    ...position.pair,
+                    baseAmount: baseBalance
+                }
+            });
+
+            const transaction = await this.txManager.createTransaction(instructions);
+
+            const result = await this.executionService.executeTransaction(
+                transaction,
+                this.wallet,
+                executionContext.txConfig
             );
 
             if (result.success) {
@@ -256,8 +334,19 @@ export class TradingEngine extends EventEmitter {
         context: TradeExecutionContext
     ): Promise<TransactionInstruction[]> {
         const { pair, amount, slippage } = context;
-        
-        return Liquidity.makeSwapInstructions({
+        const mintAta = await this.tokenPairService.getTokenBalance(
+            pair.baseToken,
+            this.wallet.publicKey
+        );
+
+        const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+            this.wallet.publicKey,
+            mintAta.token.publicKey,
+            this.wallet.publicKey,
+            pair.baseToken.mint
+        );
+
+        const swapIx = await Liquidity.makeSwapInstructions({
             connection: this.connection,
             poolKeys: await this.poolAnalyzer.getPoolKeys(pair.lpAddress),
             userKeys: {
@@ -268,6 +357,8 @@ export class TradingEngine extends EventEmitter {
             amountOutMinimum: amount.multiply(new BN(1).sub(slippage.numerator)),
             fixedSide: 'in'
         });
+
+        return [ataIx, ...swapIx];
     }
 
     private async buildSellInstructions(
@@ -295,6 +386,7 @@ export class TradingEngine extends EventEmitter {
         const { pair, userSubscription, positionId } = context;
         
         this.activePositions.set(positionId, context);
+        this.executionTimes.set(positionId, Date.now());
         await this.startPositionMonitoring(positionId);
         
         this.updateDailyStats(userSubscription.userId, {
@@ -317,6 +409,7 @@ export class TradingEngine extends EventEmitter {
         const { pair, userSubscription, positionId } = context;
         
         this.activePositions.delete(positionId);
+        this.executionTimes.delete(positionId);
         this.stopPositionMonitoring(positionId);
         
         const pnl = await this.calculatePnL(context);
@@ -334,298 +427,293 @@ export class TradingEngine extends EventEmitter {
         });
     }
 
-    private async startPositionMonitoring(positionId: string): Promise<void> {
-        const position = this.activePositions.get(positionId);
+    private async handleMarketUpdate(event: any): Promise<void> {
+        const lpAddress = event.address.toString();
+        const position = Array.from(this.activePositions.values())
+            .find(p => p.pair.lpAddress.toString() === lpAddress);
+
         if (!position) return;
 
-        const monitor = setInterval(async () => {
-            try {
-                const marketState = await this.marketDataService.getMarketState(
-                    position.pair.lpAddress
-                );
-
-                await this.checkPositionStatus(positionId, marketState);
-            } catch (error) {
-                logger.error('Position monitoring error:', error);
-            }
-        }, this.config.priceCheckInterval);
-
-        this.positionMonitors.set(positionId, monitor);
-    }
-
-    private stopPositionMonitoring(positionId: string): void {
-        const monitor = this.positionMonitors.get(positionId);
-        if (monitor) {
-            clearInterval(monitor);
-            this.positionMonitors.delete(positionId);
-        }
-    }
-
-    private async checkPositionStatus(
-        positionId: string,
-        marketState: MarketState
-    ): Promise<void> {
-        const position = this.activePositions.get(positionId);
-        if (!position) return;
+        const marketState = await this.marketDataService.getMarketState(event.address);
+        if (!marketState) return;
 
         const pnlPercent = this.calculateProfitLossPercent(position, marketState);
-        
-        if (pnlPercent.greaterThan(this.config.takeProfit)) {
+
+        if (await this.shouldClosePosition(position, marketState, pnlPercent)) {
             await this.executeSell(
                 position.pair.lpAddress,
                 position.userSubscription.userId,
-                { metadata: { reason: 'take_profit' } }
-            );
-        } else if (pnlPercent.lessThan(this.config.stopLoss)) {
-            await this.executeSell(
-                position.pair.lpAddress,
-                position.userSubscription.userId,
-                { metadata: { reason: 'stop_loss' } }
+                { metadata: { reason: 'market_update' } }
             );
         }
-
-        this.emit('position:update', {
-            positionId,
-            marketState,
-            pnlPercent
-        });
     }
 
-    private calculateProfitLossPercent(
-        position: TradeExecutionContext,
-        marketState: MarketState
-    ): Percent {
-        const entryPrice = position.pair.quoteAmount.raw;
-        const currentPrice = marketState.price;
-        
-        return new Percent(
-            currentPrice.sub(entryPrice).mul(new BN(100)),
-            entryPrice
-        );
-    }
+    private async handleNewPool(event: any): Promise<void> {
+        if (!this.isRunning || !this.config.subscriptionRequired) return;
 
-    private async calculatePnL(
-        position: TradeExecutionContext
-    ): Promise<BN> {
-        const marketState = await this.marketDataService.getMarketState(
-            position.pair.lpAddress
-        );
-        
-        return marketState.price.sub(position.pair.quoteAmount.raw);
-    }
+        try {
+            const poolState = event.state;
+            const isValidPool = await this.poolFilterService.validatePool(
+                event.address,
+                poolState
+            );
 
-    private getDailyStats(userId: string) {
-        let stats = this.dailyStats.get(userId);
-        
-        if (!stats || this.shouldResetDailyStats(stats.lastReset)) {
-            stats = {
-                trades: 0,
-                volume: ZERO,
-                pnl: ZERO,
-                lastReset: new Date()
-            };
-            this.dailyStats.set(userId, stats);
-        }
-        
-        return stats;
-    }
+            if (!isValidPool) return;
+            if (this.config.useSnipeList && 
+                    !this.snipeListService.isTokenInSnipeList(poolState.baseMint)) {
+                    logger.debug(`Skipping pool ${poolState.baseMint.toString()} - not in snipe list`);
+                    return;
+                }
 
-    private updateDailyStats(
-        userId: string,
-        update: {
-            trades: number;
-            volume: BN;
-            pnl: BN;
-        }
-    ): void {
-        const stats = this.getDailyStats(userId);
-        
-        stats.trades += update.trades;
-        stats.volume = stats.volume.add(update.volume);
-        stats.pnl = stats.pnl.add(update.pnl);
-    }
+                const poolKeys = await this.poolAnalyzer.getPoolKeys(event.address);
+                const marketState = await this.marketDataService.getMarketState(poolState.marketId);
 
-    private shouldResetDailyStats(lastReset: Date): boolean {
-        const now = new Date();
-        return now.getUTCDate() !== lastReset.getUTCDate();
-    }
+                if (!marketState || !marketState.isActive) {
+                    logger.debug(`Skipping pool ${event.address.toString()} - market inactive`);
+                    return;
+                }
 
-    private async validateSystemState(): Promise<void> {
-        const [connection, wallet] = await Promise.all([
-            this.connection.getVersion(),
-            this.connection.getAccountInfo(this.wallet.publicKey)
-        ]);
+                // Validate pool metrics
+                const liquidityUsd = new BN(poolState.quoteReserve).mul(marketState.price);
+                if (liquidityUsd.lt(this.config.minLiquidityUsd)) {
+                    logger.debug(`Skipping pool ${event.address.toString()} - insufficient liquidity`);
+                    return;
+                }
 
-        if (!connection || !wallet) {
-            throw new Error('System state validation failed');
-        }
-    }
+                const baseToken = await this.tokenPairService.getTokenByMint(poolState.baseMint);
+                const quoteToken = this.tokenPairService.USDC;
 
-    private async handleTradeEvent(event: TradeEvent): Promise<void> {
-        this.emit('trade:event', event);
-    }
-
-    private async handleRiskAlert(alert: any): Promise<void> {
-        if (this.config.emergencyCloseAll) {
-            await this.closeAllPositions();
-        }
-    }
-
-    private async closeAllPositions(): Promise<void> {
-        const positions = Array.from(this.activePositions.entries());
-        
-        for (const [positionId, position] of positions) {
-            try {
-                await this.executeSell(
-                    position.pair.lpAddress,
-                    position.userSubscription.userId,
-                    { metadata: { reason: 'emergency_close' } }
-                );
-            } catch (error) {
-                logger.error(`Failed to close position ${positionId}:`, error);
-            }
-        }
-    }
-
-    private async getTokenAccounts(pair: TradingPair): Promise<{ [key: string]: PublicKey }> {
-        const accounts = await this.connection.getTokenAccountsByOwner(
-            this.wallet.publicKey,
-            { programId: TOKEN_PROGRAM_ID }
-        );
-
-        const tokenAccounts: { [key: string]: PublicKey } = {};
-        accounts.value.forEach(({ pubkey, account }) => {
-            const accountInfo = AccountLayout.decode(account.data);
-            if (accountInfo.mint.equals(pair.baseToken.mint)) {
-                tokenAccounts[pair.baseToken.symbol] = pubkey;
-            } else if (accountInfo.mint.equals(pair.quoteToken.mint)) {
-                tokenAccounts[pair.quoteToken.symbol] = pubkey;
-            }
-        });
-
-        return tokenAccounts;
-    }
-
-    public async getPositionStatus(positionId: string): Promise<{
-        position: TradeExecutionContext;
-        marketState: MarketState;
-        pnlPercent: Percent;
-        unrealizedPnl: BN;
-    } | null> {
-        const position = this.activePositions.get(positionId);
-        if (!position) return null;
-
-        const marketState = await this.marketDataService.getMarketState(
-            position.pair.lpAddress
-        );
-
-        const pnlPercent = this.calculateProfitLossPercent(position, marketState);
-        const unrealizedPnl = marketState.price.sub(position.pair.quoteAmount.raw);
-
-        return {
-            position,
-            marketState,
-            pnlPercent,
-            unrealizedPnl
-        };
-    }
-
-    public async getUserPositions(userId: string): Promise<Array<{
-        positionId: string;
-        position: TradeExecutionContext;
-        status: {
-            marketState: MarketState;
-            pnlPercent: Percent;
-            unrealizedPnl: BN;
-        };
-    }>> {
-        const userPositions = Array.from(this.activePositions.entries())
-            .filter(([_, position]) => position.userSubscription.userId === userId);
-
-        const positionStatuses = await Promise.all(
-            userPositions.map(async ([positionId, position]) => {
-                const status = await this.getPositionStatus(positionId);
-                return {
-                    positionId,
-                    position,
-                    status: {
-                        marketState: status.marketState,
-                        pnlPercent: status.pnlPercent,
-                        unrealizedPnl: status.unrealizedPnl
-                    }
+                const pair: TradingPair = {
+                    lpAddress: event.address,
+                    baseToken,
+                    quoteToken,
+                    baseAmount: new TokenAmount(
+                        baseToken, 
+                        poolState.baseReserve
+                    ),
+                    quoteAmount: new TokenAmount(
+                        quoteToken,
+                        this.config.quoteAmount
+                    )
                 };
-            })
-        );
 
-        return positionStatuses;
-    }
+                // Validate token security
+                const tokenSecurityResult = await this.tokenValidator.validateTokenSecurity({
+                    mint: baseToken.mint,
+                    poolKeys,
+                    marketState,
+                    poolState
+                });
 
-    public async getUserStats(userId: string): Promise<{
-        dailyStats: {
-            trades: number;
-            volume: BN;
-            pnl: BN;
-        };
-        activePositionsCount: number;
-        totalPositionsValue: BN;
-    }> {
-        const stats = this.getDailyStats(userId);
-        const positions = await this.getUserPositions(userId);
+                if (!tokenSecurityResult.isSecure) {
+                    logger.debug(`Skipping pool ${event.address.toString()} - security check failed: ${tokenSecurityResult.reason}`);
+                    return;
+                }
 
-        const totalPositionsValue = positions.reduce(
-            (total, { position }) => total.add(position.pair.quoteAmount.raw),
-            ZERO
-        );
+                // Check for rate limiting
+                const lastExecutionTime = this.executionTimes.get(event.address.toString());
+                if (lastExecutionTime && 
+                    Date.now() - lastExecutionTime < this.config.minTimeBetweenTrades) {
+                    logger.debug(`Skipping pool ${event.address.toString()} - rate limited`);
+                    return;
+                }
 
-        return {
-            dailyStats: {
-                trades: stats.trades,
-                volume: stats.volume,
-                pnl: stats.pnl
-            },
-            activePositionsCount: positions.length,
-            totalPositionsValue
-        };
-    }
+                // Pre-validate trade
+                const preValidateContext: TradeExecutionContext = {
+                    pair,
+                    side: 'buy',
+                    amount: pair.quoteAmount,
+                    slippage: new Percent(this.config.slippageTolerance),
+                    timestamp: new Date(),
+                    userSubscription: await this.subscriptionValidator.getActiveSubscription(
+                        this.wallet.publicKey.toString()
+                    ),
+                    txConfig: this.buildTransactionConfig(),
+                    positionId: `${this.wallet.publicKey.toString()}-${event.address.toString()}-${Date.now()}`
+                };
 
-    public getSystemStatus(): {
-        isRunning: boolean;
-        totalActivePositions: number;
-        totalUsers: number;
-        systemUptime: number;
-    } {
-        const uniqueUsers = new Set(
-            Array.from(this.activePositions.values())
-                .map(position => position.userSubscription.userId)
-        );
+                if (!await this.riskManager.validateTrade(preValidateContext)) {
+                    logger.debug(`Skipping pool ${event.address.toString()} - risk validation failed`);
+                    return;
+                }
 
-        return {
-            isRunning: this.isRunning,
-            totalActivePositions: this.activePositions.size,
-            totalUsers: uniqueUsers.size,
-            systemUptime: process.uptime()
-        };
-    }
+                if (this.config.autoBuyDelay > 0) {
+                    logger.debug(`Waiting ${this.config.autoBuyDelay}ms before buying ${baseToken.symbol}`);
+                    await new Promise(resolve => setTimeout(resolve, this.config.autoBuyDelay));
+                }
 
-    private async handlePositionUpdate(update: {
-        positionId: string;
-        marketState: MarketState;
-        pnlPercent: Percent;
-    }): Promise<void> {
-        const position = this.activePositions.get(update.positionId);
-        if (!position) return;
+                // Recheck market conditions after delay
+                const updatedMarketState = await this.marketDataService.getMarketState(poolState.marketId);
+                if (!this.validateMarketConditions(updatedMarketState, marketState)) {
+                    logger.debug(`Skipping pool ${event.address.toString()} - market conditions changed`);
+                    return;
+                }
 
-        if (await this.riskManager.shouldClosePosition(position, update)) {
-            await this.executeSell(
-                position.pair.lpAddress,
-                position.userSubscription.userId,
-                { metadata: { reason: 'risk_management' } }
+                // Execute buy with retries
+                let success = false;
+                for (let i = 0; i < this.config.maxRetries && !success; i++) {
+                    try {
+                        success = await this.executeBuy(
+                            pair,
+                            this.wallet.publicKey.toString(),
+                            {
+                                metadata: {
+                                    source: 'auto_buy',
+                                    poolState: poolState,
+                                    marketState: updatedMarketState,
+                                    attempt: i + 1
+                                }
+                            }
+                        );
+
+                        if (success) {
+                            logger.info(`Successfully bought ${baseToken.symbol} on attempt ${i + 1}`);
+                            this.executionTimes.set(event.address.toString(), Date.now());
+                            
+                            // Emit pool discovery event
+                            this.emit('pool:traded', {
+                                address: event.address,
+                                baseToken: baseToken,
+                                quoteToken: quoteToken,
+                                timestamp: Date.now(),
+                                type: 'buy',
+                                price: marketState.price,
+                                liquidity: liquidityUsd
+                            });
+                            break;
+                        }
+                    } catch (error) {
+                        logger.error(`Buy attempt ${i + 1} failed for ${baseToken.symbol}:`, error);
+                        await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                    }
+                }
+
+                if (!success) {
+                    logger.warn(`Failed to buy ${baseToken.symbol} after ${this.config.maxRetries} attempts`);
+                }
+            } catch (error) {
+                logger.error('Error processing new pool:', error);
+                ErrorReporter.reportError(error, {
+                    context: 'TradingEngine.handleNewPool',
+                    poolAddress: event.address.toString(),
+                    timestamp: new Date().toISOString()
+                });
+            }
+        }
+
+        private validateMarketConditions(
+            current: MarketState,
+            previous: MarketState
+        ): boolean {
+            if (!current || !current.isActive) return false;
+
+            const priceChange = current.price
+                .sub(previous.price)
+                .mul(new BN(100))
+                .div(previous.price);
+
+            const volumeChange = current.volume24h
+                .sub(previous.volume24h)
+                .mul(new BN(100))
+                .div(previous.volume24h);
+
+            return (
+                priceChange.abs().lt(this.config.maxPriceChange) &&
+                volumeChange.abs().lt(this.config.maxVolumeChange) &&
+                current.liquidity.gte(this.config.minLiquidityUsd)
             );
         }
 
-        this.emit('position:status', {
-            ...update,
-            position
-        });
-    }
-}
+        private async startPositionMonitoring(positionId: string): Promise<void> {
+            const position = this.activePositions.get(positionId);
+            if (!position) return;
+
+            const monitor = setInterval(async () => {
+                try {
+                    const marketState = await this.marketDataService.getMarketState(
+                        position.pair.lpAddress
+                    );
+
+                    if (!marketState) {
+                        logger.warn(`Failed to get market state for position ${positionId}`);
+                        return;
+                    }
+
+                    await this.checkPositionStatus(positionId, marketState);
+                } catch (error) {
+                    logger.error(`Position monitoring error for ${positionId}:`, error);
+                    ErrorReporter.reportError(error, {
+                        context: 'TradingEngine.positionMonitoring',
+                        positionId,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            }, this.config.priceCheckInterval);
+
+            this.positionMonitors.set(positionId, monitor);
+        }
+
+        private async checkPositionStatus(
+            positionId: string,
+            marketState: MarketState
+        ): Promise<void> {
+            const position = this.activePositions.get(positionId);
+            if (!position) return;
+
+            const pnlPercent = this.calculateProfitLossPercent(position, marketState);
+            const holdingTime = Date.now() - position.timestamp.getTime();
+
+            const shouldClose = 
+                pnlPercent.greaterThan(this.config.takeProfit) ||
+                pnlPercent.lessThan(this.config.stopLoss.mul(new BN(-1))) ||
+                holdingTime >= this.config.maxHoldingTime ||
+                await this.riskManager.shouldClosePosition(position, {
+                    marketState,
+                    pnlPercent,
+                    holdingTime
+                });
+
+            if (shouldClose) {
+                try {
+                    await this.executeSell(
+                        position.pair.lpAddress,
+                        position.userSubscription.userId,
+                        {
+                            metadata: {
+                                reason: this.getCloseReason(pnlPercent, holdingTime),
+                                pnlPercent: pnlPercent.toString(),
+                                holdingTime
+                            }
+                        }
+                    );
+                } catch (error) {
+                    logger.error(`Failed to close position ${positionId}:`, error);
+                    ErrorReporter.reportError(error, {
+                        context: 'TradingEngine.checkPositionStatus',
+                        positionId,
+                        pnlPercent: pnlPercent.toString(),
+                        holdingTime
+                    });
+                }
+            }
+
+            this.emit('position:update', {
+                positionId,
+                marketState,
+                pnlPercent,
+                holdingTime
+            });
+        }
+
+        private getCloseReason(pnlPercent: Percent, holdingTime: number): string {
+            if (pnlPercent.greaterThan(this.config.takeProfit)) {
+                return 'take_profit';
+            }
+            if (pnlPercent.lessThan(this.config.stopLoss.mul(new BN(-1)))) {
+                return 'stop_loss';
+            }
+            if (holdingTime >= this.config.maxHoldingTime) {
+                return 'max_holding_time';
+            }
+            return 'risk_management';
+        }
