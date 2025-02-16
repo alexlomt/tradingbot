@@ -1,0 +1,13 @@
+{
+    "lastStartTime": "2025-02-16T03:57:44.000Z",
+    "totalTradesExecuted": 0,
+    "dailyVolume": "0",
+    "activePools": [],
+    "blacklistedPools": [],
+    "whitelistedPools": [],
+    "customStrategyConfigs": {},
+    "emergencyMode": false,
+    "maintenanceMode": false,
+    "lastBackupTime": "2025-02-16T03:57:44.000Z",
+    "version": "1.0.0"
+}
