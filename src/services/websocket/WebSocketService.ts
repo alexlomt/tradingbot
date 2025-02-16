@@ -1,332 +1,280 @@
 import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Connection, PublicKey } from '@solana/web3.js';
+import { Market } from '@project-serum/serum';
+import { w3cwebsocket as W3CWebSocket } from 'websocket';
 import { MetricsService } from '../metrics/MetricsService';
 import { AuditService } from '../audit/AuditService';
-import { Subject, BehaviorSubject } from 'rxjs';
-import { WebSocket } from 'ws';
-import { MarketEvent, MarketEventType, MarketChannel } from '../../types/market.types';
-import { RetryStrategy } from '../../utils/RetryStrategy';
+import { Subject, BehaviorSubject, interval, Observable } from 'rxjs';
+import { filter, map, retryWhen, delay, take } from 'rxjs/operators';
+import { MarketData, OrderBookUpdate, TradeUpdate } from '../../types/market.types';
+import { Decimal } from 'decimal.js';
 
-interface WebSocketConnection {
-    ws: WebSocket;
-    url: string;
-    isAlive: boolean;
-    subscriptions: Set<string>;
-    reconnectAttempts: number;
+interface WebSocketMessage {
+    type: string;
+    market: string;
+    data: any;
 }
 
 @Injectable()
 export class WebSocketService implements OnModuleInit, OnModuleDestroy {
-    private connections: Map<string, WebSocketConnection> = new Map();
-    private messageSubject = new Subject<MarketEvent>();
-    private connectionStatus = new BehaviorSubject<boolean>(false);
-    
-    private readonly PING_INTERVAL = 30000;
+    private ws: W3CWebSocket;
+    private readonly connection: Connection;
+    private readonly messageSubject = new Subject<WebSocketMessage>();
+    private readonly connectionStatus = new BehaviorSubject<boolean>(false);
+    private readonly subscriptions = new Map<string, Set<string>>();
+    private readonly markets = new Map<string, Market>();
     private readonly MAX_RECONNECT_ATTEMPTS = 5;
-    private readonly INITIAL_RECONNECT_DELAY = 1000;
-    private readonly MAX_RECONNECT_DELAY = 30000;
-    private pingInterval: NodeJS.Timeout;
+    private readonly PING_INTERVAL = 30000; // 30 seconds
+    private readonly RECONNECT_DELAY = 5000; // 5 seconds
 
     constructor(
         private readonly configService: ConfigService,
         private readonly metricsService: MetricsService,
         private readonly auditService: AuditService
-    ) {}
+    ) {
+        this.connection = new Connection(
+            this.configService.get<string>('SOLANA_RPC_WEBSOCKET_URL'),
+            'confirmed'
+        );
+    }
 
     async onModuleInit() {
-        await this.initializeConnections();
-        this.startPingInterval();
+        await this.initializeWebSocket();
+        this.startHeartbeat();
     }
 
-    async onModuleDestroy() {
-        this.stopPingInterval();
-        await this.closeAllConnections();
+    onModuleDestroy() {
+        this.closeConnection();
     }
 
-    private async initializeConnections() {
-        const endpoints = this.configService.get<string[]>('WEBSOCKET_ENDPOINTS');
-        
-        for (const endpoint of endpoints) {
-            await this.createConnection(endpoint);
-        }
-    }
-
-    private async createConnection(url: string): Promise<WebSocketConnection> {
+    private async initializeWebSocket() {
         try {
-            const ws = new WebSocket(url, {
-                handshakeTimeout: 10000,
-                perMessageDeflate: true,
-                headers: this.getAuthHeaders()
-            });
-
-            const connection: WebSocketConnection = {
-                ws,
-                url,
-                isAlive: false,
-                subscriptions: new Set(),
-                reconnectAttempts: 0
-            };
-
-            this.setupWebSocketHandlers(connection);
-            this.connections.set(url, connection);
-
-            await this.waitForConnection(connection);
-            return connection;
-        } catch (error) {
-            await this.handleError('createConnection', error, { url });
-            throw error;
-        }
-    }
-
-    private setupWebSocketHandlers(connection: WebSocketConnection) {
-        const { ws, url } = connection;
-
-        ws.on('open', async () => {
-            connection.isAlive = true;
-            connection.reconnectAttempts = 0;
-            this.connectionStatus.next(true);
-            
-            await this.auditService.logSystemEvent({
-                event: 'WEBSOCKET_CONNECTED',
-                details: { url },
-                severity: 'INFO'
-            });
-
-            // Resubscribe to channels after reconnection
-            await this.resubscribeChannels(connection);
-        });
-
-        ws.on('message', async (data: Buffer) => {
-            try {
-                const message = JSON.parse(data.toString());
-                await this.handleMessage(message);
-                await this.metricsService.recordWebSocketMessage(message.type);
-            } catch (error) {
-                await this.handleError('messageHandler', error, { url });
-            }
-        });
-
-        ws.on('pong', () => {
-            connection.isAlive = true;
-        });
-
-        ws.on('error', async (error) => {
-            await this.handleError('websocketError', error, { url });
-        });
-
-        ws.on('close', async () => {
-            connection.isAlive = false;
-            this.connectionStatus.next(false);
-            
-            await this.auditService.logSystemEvent({
-                event: 'WEBSOCKET_DISCONNECTED',
-                details: { url },
-                severity: 'WARNING'
-            });
-
-            await this.handleReconnection(connection);
-        });
-    }
-
-    private async handleReconnection(connection: WebSocketConnection) {
-        if (connection.reconnectAttempts >= this.MAX_RECONNECT_ATTEMPTS) {
-            await this.auditService.logSystemEvent({
-                event: 'WEBSOCKET_RECONNECTION_FAILED',
-                details: {
-                    url: connection.url,
-                    attempts: connection.reconnectAttempts
-                },
-                severity: 'ERROR'
-            });
-            return;
-        }
-
-        const delay = RetryStrategy.exponentialBackoff(
-            connection.reconnectAttempts,
-            this.INITIAL_RECONNECT_DELAY,
-            this.MAX_RECONNECT_DELAY
-        );
-
-        connection.reconnectAttempts++;
-
-        setTimeout(async () => {
-            try {
-                await this.createConnection(connection.url);
-            } catch (error) {
-                await this.handleError('reconnection', error, { url: connection.url });
-            }
-        }, delay);
-    }
-
-    async subscribe(channel: string, callback: (data: any) => void): Promise<void> {
-        const connection = this.getOptimalConnection();
-        if (!connection) {
-            throw new Error('No available WebSocket connections');
-        }
-
-        try {
-            const subscribeMessage = {
-                type: 'subscribe',
-                channel,
-                auth: this.getAuthToken()
-            };
-
-            connection.ws.send(JSON.stringify(subscribeMessage));
-            connection.subscriptions.add(channel);
-
-            this.messageSubject.subscribe((event: MarketEvent) => {
-                if (event.type === channel) {
-                    callback(event.data);
+            const url = this.configService.get<string>('WEBSOCKET_URL');
+            this.ws = new W3CWebSocket(url, {
+                headers: {
+                    'Auth-Key': this.configService.get<string>('WEBSOCKET_AUTH_KEY')
                 }
             });
 
-            await this.auditService.logSystemEvent({
-                event: 'WEBSOCKET_SUBSCRIBED',
-                details: { channel },
-                severity: 'INFO'
-            });
-        } catch (error) {
-            await this.handleError('subscribe', error, { channel });
-            throw error;
-        }
-    }
+            this.ws.onopen = () => {
+                this.connectionStatus.next(true);
+                this.resubscribeAll();
+                this.auditService.logSystemEvent({
+                    event: 'WEBSOCKET_CONNECTED',
+                    details: { url },
+                    severity: 'INFO'
+                });
+            };
 
-    async unsubscribe(channel: string): Promise<void> {
-        for (const connection of this.connections.values()) {
-            if (connection.subscriptions.has(channel)) {
+            this.ws.onclose = async () => {
+                this.connectionStatus.next(false);
+                await this.handleDisconnect();
+            };
+
+            this.ws.onerror = async (error) => {
+                await this.handleError('websocket_error', error);
+            };
+
+            this.ws.onmessage = (message) => {
                 try {
-                    const unsubscribeMessage = {
-                        type: 'unsubscribe',
-                        channel
-                    };
-
-                    connection.ws.send(JSON.stringify(unsubscribeMessage));
-                    connection.subscriptions.delete(channel);
-
-                    await this.auditService.logSystemEvent({
-                        event: 'WEBSOCKET_UNSUBSCRIBED',
-                        details: { channel },
-                        severity: 'INFO'
-                    });
+                    const data = JSON.parse(message.data as string);
+                    this.messageSubject.next(data);
                 } catch (error) {
-                    await this.handleError('unsubscribe', error, { channel });
+                    this.handleError('message_parse', error);
                 }
-            }
+            };
+
+        } catch (error) {
+            await this.handleError('initialization', error);
         }
     }
 
-    private async handleMessage(message: any) {
-        if (message.type === 'error') {
-            await this.handleError('serverError', new Error(message.message), message);
-            return;
-        }
+    private async handleDisconnect() {
+        await this.auditService.logSystemEvent({
+            event: 'WEBSOCKET_DISCONNECTED',
+            details: { timestamp: new Date() },
+            severity: 'WARNING'
+        });
 
-        const event: MarketEvent = {
-            type: message.type as MarketEventType,
-            market: message.market,
-            timestamp: Date.now(),
-            data: message.data
-        };
-
-        this.messageSubject.next(event);
-    }
-
-    private startPingInterval() {
-        this.pingInterval = setInterval(() => {
-            for (const connection of this.connections.values()) {
-                if (!connection.isAlive) {
-                    connection.ws.terminate();
-                    continue;
-                }
-
-                connection.isAlive = false;
-                connection.ws.ping();
-            }
-        }, this.PING_INTERVAL);
-    }
-
-    private stopPingInterval() {
-        if (this.pingInterval) {
-            clearInterval(this.pingInterval);
-        }
-    }
-
-    private async closeAllConnections() {
-        for (const connection of this.connections.values()) {
-            connection.ws.close();
-        }
-        this.connections.clear();
-    }
-
-    private getOptimalConnection(): WebSocketConnection | null {
-        // Simple round-robin selection for now
-        // Could be enhanced with load balancing metrics
-        for (const connection of this.connections.values()) {
-            if (connection.isAlive) {
-                return connection;
-            }
-        }
-        return null;
-    }
-
-    private async resubscribeChannels(connection: WebSocketConnection) {
-        for (const channel of connection.subscriptions) {
+        let attempts = 0;
+        while (attempts < this.MAX_RECONNECT_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, this.RECONNECT_DELAY));
             try {
-                const subscribeMessage = {
-                    type: 'subscribe',
-                    channel,
-                    auth: this.getAuthToken()
-                };
-                connection.ws.send(JSON.stringify(subscribeMessage));
+                await this.initializeWebSocket();
+                if (this.connectionStatus.value) {
+                    return;
+                }
             } catch (error) {
-                await this.handleError('resubscribe', error, { channel });
+                attempts++;
             }
+        }
+
+        await this.auditService.logSystemEvent({
+            event: 'WEBSOCKET_RECONNECT_FAILED',
+            details: { attempts },
+            severity: 'CRITICAL'
+        });
+    }
+
+    private startHeartbeat() {
+        interval(this.PING_INTERVAL).subscribe(() => {
+            if (this.connectionStatus.value) {
+                this.send({ type: 'ping' });
+            }
+        });
+    }
+
+    async subscribe(
+        market: string,
+        channels: string[]
+    ): Promise<boolean> {
+        try {
+            if (!this.subscriptions.has(market)) {
+                this.subscriptions.set(market, new Set());
+            }
+
+            const marketSubs = this.subscriptions.get(market);
+            channels.forEach(channel => marketSubs.add(channel));
+
+            if (this.connectionStatus.value) {
+                await this.send({
+                    type: 'subscribe',
+                    market,
+                    channels
+                });
+            }
+
+            await this.metricsService.incrementSubscription(market);
+            return true;
+        } catch (error) {
+            await this.handleError('subscribe', error);
+            return false;
         }
     }
 
-    private getAuthHeaders(): Record<string, string> {
-        return {
-            'Authorization': `Bearer ${this.getAuthToken()}`,
-            'X-API-Key': this.configService.get<string>('API_KEY')
-        };
+    async unsubscribe(
+        market: string,
+        channels: string[]
+    ): Promise<boolean> {
+        try {
+            const marketSubs = this.subscriptions.get(market);
+            if (!marketSubs) return true;
+
+            channels.forEach(channel => marketSubs.delete(channel));
+            
+            if (marketSubs.size === 0) {
+                this.subscriptions.delete(market);
+            }
+
+            if (this.connectionStatus.value) {
+                await this.send({
+                    type: 'unsubscribe',
+                    market,
+                    channels
+                });
+            }
+
+            return true;
+        } catch (error) {
+            await this.handleError('unsubscribe', error);
+            return false;
+        }
     }
 
-    private getAuthToken(): string {
-        return this.configService.get<string>('AUTH_TOKEN');
+    getOrderBookUpdates(market: string): Observable<OrderBookUpdate> {
+        return this.messageSubject.pipe(
+            filter(msg => 
+                msg.type === 'orderbook' && 
+                msg.market === market
+            ),
+            map(msg => ({
+                bids: msg.data.bids.map(this.processLevel),
+                asks: msg.data.asks.map(this.processLevel)
+            }))
+        );
+    }
+
+    getTradeUpdates(market: string): Observable<TradeUpdate> {
+        return this.messageSubject.pipe(
+            filter(msg => 
+                msg.type === 'trade' && 
+                msg.market === market
+            ),
+            map(msg => ({
+                price: new Decimal(msg.data.price),
+                size: new Decimal(msg.data.size),
+                side: msg.data.side,
+                timestamp: new Date(msg.data.timestamp)
+            }))
+        );
+    }
+
+    getMarketData(market: string): Observable<MarketData> {
+        return this.messageSubject.pipe(
+            filter(msg => 
+                msg.type === 'ticker' && 
+                msg.market === market
+            ),
+            map(msg => ({
+                lastPrice: new Decimal(msg.data.lastPrice),
+                bidPrice: new Decimal(msg.data.bidPrice),
+                askPrice: new Decimal(msg.data.askPrice),
+                volume24h: new Decimal(msg.data.volume24h),
+                priceChange24h: new Decimal(msg.data.priceChange24h),
+                highPrice24h: new Decimal(msg.data.highPrice24h),
+                lowPrice24h: new Decimal(msg.data.lowPrice24h)
+            }))
+        );
+    }
+
+    private async send(message: any): Promise<void> {
+        if (!this.connectionStatus.value) {
+            throw new Error('WebSocket not connected');
+        }
+
+        try {
+            this.ws.send(JSON.stringify(message));
+        } catch (error) {
+            await this.handleError('send_message', error);
+            throw error;
+        }
+    }
+
+    private async resubscribeAll() {
+        for (const [market, channels] of this.subscriptions.entries()) {
+            await this.send({
+                type: 'subscribe',
+                market,
+                channels: Array.from(channels)
+            });
+        }
+    }
+
+    private processLevel(level: [string, string]): [Decimal, Decimal] {
+        return [
+            new Decimal(level[0]), // price
+            new Decimal(level[1])  // size
+        ];
     }
 
     private async handleError(
         operation: string,
-        error: Error,
-        context: any
+        error: Error
     ): Promise<void> {
         await this.auditService.logSystemEvent({
             event: 'WEBSOCKET_ERROR',
             details: {
                 operation,
-                error: error.message,
-                context
+                error: error.message
             },
             severity: 'ERROR'
         });
-        await this.metricsService.incrementWebSocketError(operation);
+
+        await this.metricsService.incrementError('websocket');
     }
 
-    private waitForConnection(connection: WebSocketConnection): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('WebSocket connection timeout'));
-            }, 10000);
-
-            connection.ws.once('open', () => {
-                clearTimeout(timeout);
-                resolve();
-            });
-
-            connection.ws.once('error', (error) => {
-                clearTimeout(timeout);
-                reject(error);
-            });
-        });
+    getConnectionStatus(): Observable<boolean> {
+        return this.connectionStatus.asObservable();
     }
 }
